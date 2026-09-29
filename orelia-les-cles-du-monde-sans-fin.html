@@ -2824,3 +2824,341 @@ loop();
 
 
 </body></html>
+(function (global) {
+  "use strict";
+
+  // ---------------------------------------------------------
+  // 0. Configuration
+  // ---------------------------------------------------------
+  const CONFIG = {
+    // Cle de signature locale. CHANGEZ-LA. Elle n'est pas secrete
+    // (elle est dans le code) mais elle bloque les bidouilles simples.
+    secret: "changez-moi-par-une-longue-chaine-aleatoire-4f9a2c",
+    prefix: "jeu_",                 // prefixe des cles de sauvegarde
+    scoreMaxParSeconde: 500,        // plafond de gain de score realiste
+    scoreMaxAbsolu: 10_000_000,     // score au-dela duquel on refuse
+    actionsMaxParSeconde: 20,       // anti-spam de clics / requetes
+    dureeMinPartieMs: 1500,         // une partie plus courte = suspecte
+  };
+
+  // ---------------------------------------------------------
+  // 1. Outils cryptographiques legers (hash + signature)
+  // ---------------------------------------------------------
+  function hash(str) {
+    // FNV-1a 64 bits simule sur 2x32 bits -> chaine hex stable
+    let h1 = 0x811c9dc5, h2 = 0x01000193;
+    for (let i = 0; i < str.length; i++) {
+      const c = str.charCodeAt(i);
+      h1 ^= c; h1 = Math.imul(h1, 16777619) >>> 0;
+      h2 = (Math.imul(h2 ^ c, 2654435761) + h1) >>> 0;
+    }
+    return (h1 >>> 0).toString(16).padStart(8, "0") +
+           (h2 >>> 0).toString(16).padStart(8, "0");
+  }
+
+  function signer(valeur) {
+    return hash(CONFIG.secret + "|" + valeur + "|" + CONFIG.secret);
+  }
+
+  // ---------------------------------------------------------
+  // 2. Validation stricte des entrees (anti-injection, anti-XSS)
+  // ---------------------------------------------------------
+  const Valider = {
+    pseudo(v) {
+      if (typeof v !== "string") return null;
+      const p = v.trim().normalize("NFKC").slice(0, 20);
+      // lettres, chiffres, espace, - et _ uniquement
+      if (!/^[\p{L}\p{N} _-]{2,20}$/u.test(p)) return null;
+      return p;
+    },
+    entier(v, min, max) {
+      const n = Number(v);
+      if (!Number.isFinite(n) || !Number.isInteger(n)) return null;
+      if (n < min || n > max) return null;
+      return n;
+    },
+    texte(v, maxLen = 200) {
+      if (typeof v !== "string") return "";
+      return v.replace(/[\u0000-\u001F\u007F]/g, "").trim().slice(0, maxLen);
+    },
+  };
+
+  // JAMAIS innerHTML avec du texte joueur. Utilisez ceci :
+  function afficherTexte(element, texte) {
+    if (!element) return;
+    element.textContent = String(texte);
+  }
+
+  // Echappement si vous devez vraiment construire du HTML
+  function echapperHTML(s) {
+    return String(s).replace(/[&<>"'`=\/]/g, (c) => ({
+      "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;",
+      "'": "&#39;", "`": "&#96;", "=": "&#61;", "/": "&#47;",
+    })[c]);
+  }
+
+  // ---------------------------------------------------------
+  // 3. Sauvegarde signee (localStorage infalsifiable "a la main")
+  // ---------------------------------------------------------
+  const Sauvegarde = {
+    ecrire(cle, donnees) {
+      const charge = JSON.stringify({ d: donnees, t: Date.now() });
+      const paquet = { c: btoa(unescape(encodeURIComponent(charge))) };
+      paquet.s = signer(paquet.c);
+      try {
+        localStorage.setItem(CONFIG.prefix + cle, JSON.stringify(paquet));
+        return true;
+      } catch (_) { return false; }
+    },
+    lire(cle, defaut = null) {
+      try {
+        const brut = localStorage.getItem(CONFIG.prefix + cle);
+        if (!brut) return defaut;
+        const paquet = JSON.parse(brut);
+        if (!paquet || typeof paquet.c !== "string") return defaut;
+        if (signer(paquet.c) !== paquet.s) {      // signature cassee
+          AntiTriche.signaler("sauvegarde_modifiee", { cle });
+          localStorage.removeItem(CONFIG.prefix + cle);
+          return defaut;
+        }
+        return JSON.parse(decodeURIComponent(escape(atob(paquet.c)))).d;
+      } catch (_) { return defaut; }
+    },
+    effacer(cle) { localStorage.removeItem(CONFIG.prefix + cle); },
+  };
+
+  // ---------------------------------------------------------
+  // 4. Score protege (variable cachee + miroir + coherence temps)
+  // ---------------------------------------------------------
+  class ScoreProtege {
+    #valeur = 0;      // champ prive : invisible depuis la console
+    #miroir = 0;      // copie decalee pour detecter un patch memoire
+    #debut = Date.now();
+    #corrompu = false;
+
+    constructor(depart = 0) {
+      this.#valeur = depart;
+      this.#miroir = depart ^ 0x5f3759df;
+    }
+    #verifier() {
+      if ((this.#miroir ^ 0x5f3759df) !== this.#valeur) {
+        this.#corrompu = true;
+        AntiTriche.signaler("score_memoire_modifie");
+      }
+      return !this.#corrompu;
+    }
+    ajouter(points) {
+      const p = Valider.entier(points, -100000, 100000);
+      if (p === null) { AntiTriche.signaler("points_invalides", { points }); return this.valeur; }
+      if (!this.#verifier()) return this.valeur;
+
+      const secondes = Math.max(1, (Date.now() - this.#debut) / 1000);
+      const plafond = secondes * CONFIG.scoreMaxParSeconde;
+      if (this.#valeur + p > plafond || this.#valeur + p > CONFIG.scoreMaxAbsolu) {
+        AntiTriche.signaler("score_irrealiste", { tente: this.#valeur + p, plafond });
+        return this.valeur;
+      }
+      this.#valeur += p;
+      this.#miroir = this.#valeur ^ 0x5f3759df;
+      return this.valeur;
+    }
+    get valeur() { return this.#corrompu ? 0 : this.#valeur; }
+    get valide() {
+      return !this.#corrompu && (Date.now() - this.#debut) >= CONFIG.dureeMinPartieMs;
+    }
+    get dureeMs() { return Date.now() - this.#debut; }
+    // Jeton a envoyer si un jour vous ajoutez un serveur
+    jeton() {
+      const corps = `${this.valeur}:${this.#debut}:${Date.now()}`;
+      return corps + "." + signer(corps);
+    }
+  }
+
+  // ---------------------------------------------------------
+  // 5. Anti-spam / limitation de cadence
+  // ---------------------------------------------------------
+  const Cadence = (() => {
+    const compteurs = new Map();
+    return {
+      autorise(action, maxParSeconde = CONFIG.actionsMaxParSeconde) {
+        const now = Date.now();
+        const e = compteurs.get(action) || { n: 0, t: now };
+        if (now - e.t > 1000) { e.n = 0; e.t = now; }
+        e.n++;
+        compteurs.set(action, e);
+        if (e.n > maxParSeconde) {
+          AntiTriche.signaler("spam_action", { action, n: e.n });
+          return false;
+        }
+        return true;
+      },
+    };
+  })();
+
+  // ---------------------------------------------------------
+  // 6. Detection de triche (horloge, automatisation, fonctions patchees)
+  // ---------------------------------------------------------
+  const AntiTriche = (() => {
+    const incidents = [];
+    let onAlerte = null;
+
+    // Empreintes des fonctions natives : si elles changent, elles ont ete
+    // remplacees (outil de triche type "speed hack").
+    const natives = {
+      setTimeout: String(global.setTimeout),
+      setInterval: String(global.setInterval),
+      requestAnimationFrame: String(global.requestAnimationFrame || ""),
+      dateNow: String(Date.now),
+      random: String(Math.random),
+    };
+
+    function verifierNatives() {
+      for (const [nom, src] of Object.entries(natives)) {
+        const actuel = nom === "dateNow" ? String(Date.now)
+                     : nom === "random" ? String(Math.random)
+                     : String(global[nom] || "");
+        if (actuel !== src) signaler("fonction_native_remplacee", { nom });
+      }
+    }
+
+    // Horloge : compare Date.now (falsifiable) et performance.now (plus dur)
+    let refDate = Date.now(), refPerf = performance.now();
+    function verifierHorloge() {
+      const dDate = Date.now() - refDate;
+      const dPerf = performance.now() - refPerf;
+      if (Math.abs(dDate - dPerf) > 2000) {
+        signaler("horloge_manipulee", { dDate: Math.round(dDate), dPerf: Math.round(dPerf) });
+      }
+      refDate = Date.now(); refPerf = performance.now();
+    }
+
+    // Automatisation (bot / Selenium / Puppeteer)
+    function verifierBot() {
+      if (navigator.webdriver === true) signaler("navigateur_automatise");
+      if (global.__nightmare || global._phantom || global.callPhantom) signaler("outil_automatisation");
+    }
+
+    function signaler(type, details = {}) {
+      const inc = { type, details, at: new Date().toISOString() };
+      incidents.push(inc);
+      if (incidents.length > 100) incidents.shift();
+      if (typeof onAlerte === "function") { try { onAlerte(inc); } catch (_) {} }
+    }
+
+    function demarrer(callback) {
+      onAlerte = callback || null;
+      verifierBot();
+      verifierNatives();
+      setInterval(() => { verifierNatives(); verifierHorloge(); }, 3000);
+      // Evenements clavier/souris non generes par un humain
+      document.addEventListener("click", (e) => {
+        if (!e.isTrusted) signaler("clic_synthetique");
+      }, true);
+    }
+
+    return { demarrer, signaler, get incidents() { return incidents.slice(); },
+             get propre() { return incidents.length === 0; } };
+  })();
+
+  // ---------------------------------------------------------
+  // 7. Durcissement de la page (a mettre AUSSI cote hebergement)
+  // ---------------------------------------------------------
+  const Durcir = {
+    // Gele les objets de config pour empecher leur reecriture
+    geler(obj) { Object.freeze(obj); return obj; },
+
+    // Bloque le glisser-deposer de fichiers et la selection de l'UI
+    interfaces() {
+      ["dragover", "drop"].forEach((ev) =>
+        global.addEventListener(ev, (e) => e.preventDefault(), false));
+    },
+
+    // Erreurs : ne jamais afficher de details techniques au joueur
+    erreurs() {
+      global.addEventListener("error", (e) => {
+        console.warn("[jeu] erreur interceptee");
+        AntiTriche.signaler("erreur_js", { message: String(e.message).slice(0, 120) });
+      });
+      global.addEventListener("unhandledrejection", () => {
+        AntiTriche.signaler("promesse_rejetee");
+      });
+    },
+
+    tout() { this.interfaces(); this.erreurs(); },
+  };
+
+  // ---------------------------------------------------------
+  // 8. API publique
+  // ---------------------------------------------------------
+  const API = {
+    CONFIG, Valider, Sauvegarde, Cadence, AntiTriche, Durcir,
+    ScoreProtege, hash, signer, echapperHTML, afficherTexte,
+
+    init(options = {}) {
+      Object.assign(CONFIG, options.config || {});
+      Durcir.tout();
+      AntiTriche.demarrer(options.onTriche);
+      return this;
+    },
+  };
+
+  Object.freeze(API);
+  Object.defineProperty(global, "Securite", { value: API, writable: false, configurable: false });
+})(window);
+
+
+/* =============================================================
+   EXEMPLE D'UTILISATION dans votre jeu
+   -------------------------------------------------------------
+
+   Securite.init({
+     config: { secret: "ma-cle-perso-longue-et-unique" },
+     onTriche: (incident) => {
+       console.warn("Triche detectee :", incident.type);
+       // ex : remettre la partie a zero, afficher un message, etc.
+     },
+   });
+
+   const score = new Securite.ScoreProtege(0);
+
+   function surEnnemiTue() {
+     if (!Securite.Cadence.autorise("tuer", 30)) return; // anti-spam
+     score.ajouter(10);
+     Securite.afficherTexte(document.getElementById("score"), score.valeur);
+   }
+
+   function finDePartie() {
+     if (!score.valide || !Securite.AntiTriche.propre) {
+       alert("Partie invalide : score non enregistre.");
+       return;
+     }
+     const meilleur = Securite.Sauvegarde.lire("record", 0);
+     if (score.valeur > meilleur) Securite.Sauvegarde.ecrire("record", score.valeur);
+   }
+
+   const pseudo = Securite.Valider.pseudo(document.getElementById("pseudo").value);
+   if (!pseudo) alert("Pseudo invalide (2 a 20 caracteres).");
+
+
+   =============================================================
+   9. A FAIRE AUSSI (hors JavaScript)
+   -------------------------------------------------------------
+   a) En-tetes HTTP sur votre hebergement (GitHub Pages ne les permet pas,
+      utilisez Netlify/Cloudflare Pages avec un fichier _headers) :
+
+      Content-Security-Policy: default-src 'self'; script-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'
+      X-Content-Type-Options: nosniff
+      Referrer-Policy: no-referrer
+      Permissions-Policy: geolocation=(), microphone=(), camera=()
+
+   b) Aucune cle d'API, mot de passe ou jeton dans le code HTML/JS :
+      tout ce qui est dans la page est public, meme "minifie".
+
+   c) Comptes joueurs et classement officiel : impossibles a securiser
+      sans serveur. Il faut une base de donnees qui verifie les scores
+      et qui garde les mots de passe. Dites-le moi si vous voulez que je
+      le mette en place.
+
+   d) Minifiez / obscurcissez le code avant publication (terser,
+      javascript-obfuscator). Cela ralentit les curieux, sans plus.
+   ============================================================= */
